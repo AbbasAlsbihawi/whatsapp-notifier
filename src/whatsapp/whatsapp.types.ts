@@ -24,7 +24,7 @@ export interface BulkResult {
 
 export interface WhatsAppStatus {
   status: ConnectionStatus;
-  qrCode?: string;
-  connectedAt?: Date;
-  phone?: string;
+  qrCode?: string | null;
+  connectedAt?: Date | null;
+  phone?: string | null;
 }

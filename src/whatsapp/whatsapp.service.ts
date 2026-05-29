@@ -9,7 +9,6 @@ import makeWASocket, {
   DisconnectReason,
   useMultiFileAuthState,
   WASocket,
-  proto,
   AnyMessageContent,
   fetchLatestBaileysVersion,
 } from '@whiskeysockets/baileys';
@@ -32,7 +31,7 @@ export class WhatsappService implements OnModuleInit, OnModuleDestroy {
   private reconnectAttempts = 0;
   private readonly MAX_RECONNECT = 5;
 
-  constructor(private readonly configService: ConfigService) { }
+  constructor(private readonly configService: ConfigService) {}
 
   async onModuleInit() {
     await this.connect();
@@ -46,8 +45,8 @@ export class WhatsappService implements OnModuleInit, OnModuleDestroy {
 
   async connect() {
     try {
-      const authDir = this.configService.get<string>('whatsapp.authDir');
-      const printQr = this.configService.get<boolean>('whatsapp.printQr');
+      const authDir = this.configService.get<string>('whatsapp.authDir') ?? './auth_info';
+      const printQr = this.configService.get<boolean>('whatsapp.printQr') ?? true;
 
       const { state, saveCreds } = await useMultiFileAuthState(authDir);
       const { version } = await fetchLatestBaileysVersion();
@@ -55,11 +54,12 @@ export class WhatsappService implements OnModuleInit, OnModuleDestroy {
       this.logger.log(`Using WA Web version: ${version.join('.')}`);
       this.status = ConnectionStatus.CONNECTING;
 
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
       this.sock = makeWASocket({
         version,
         auth: state,
         printQRInTerminal: printQr,
-        logger: require('pino')({ level: 'silent' }), // suppress baileys logs
+        logger: require('pino')({ level: 'silent' }),
       });
 
       this.sock.ev.on('creds.update', saveCreds);
@@ -80,8 +80,8 @@ export class WhatsappService implements OnModuleInit, OnModuleDestroy {
           this.qrCode = null;
 
           // get connected phone number
-          const me = this.sock.user;
-          this.connectedPhone = me?.id?.split(':')[0] || null;
+          const me = this.sock?.user;
+          this.connectedPhone = me?.id?.split(':')[0] ?? null;
 
           this.logger.log(`✅ WhatsApp connected as: ${this.connectedPhone}`);
         }
@@ -111,7 +111,7 @@ export class WhatsappService implements OnModuleInit, OnModuleDestroy {
         }
       });
     } catch (error) {
-      this.logger.error('Failed to connect:', error.message);
+      this.logger.error('Failed to connect:', (error as Error).message);
       throw error;
     }
   }
@@ -143,14 +143,13 @@ export class WhatsappService implements OnModuleInit, OnModuleDestroy {
   // ─── Messaging ────────────────────────────────────────────────────────────
 
   /**
-   * Normalize phone number to WhatsApp JID format
+   * Normalize phone number to WhatsApp JID format.
    * Accepts: 9647501234567 | +9647501234567 | 07501234567
    */
   private normalizeJid(phone: string): string {
-    // Remove all non-numeric characters
     let normalized = phone.replace(/\D/g, '');
 
-    // Iraqi local number → add country code
+    // Iraqi local number (starts with 0) → add country code
     if (normalized.startsWith('0')) {
       normalized = '964' + normalized.slice(1);
     }
@@ -164,27 +163,30 @@ export class WhatsappService implements OnModuleInit, OnModuleDestroy {
     }
 
     const jid = this.normalizeJid(phone);
-    const maxRetries = this.configService.get<number>('whatsapp.maxRetries');
+    const maxRetries = this.configService.get<number>('whatsapp.maxRetries') ?? 3;
 
     for (let attempt = 1; attempt <= maxRetries; attempt++) {
       try {
-        const msg = await this.sock.sendMessage(jid, { text });
+        const msg = await this.sock!.sendMessage(jid, { text });
         return {
           phone,
           status: 'sent',
-          messageId: msg?.key?.id,
+          messageId: msg?.key?.id ?? undefined,
           sentAt: new Date(),
         };
       } catch (error) {
         this.logger.warn(
-          `Attempt ${attempt}/${maxRetries} failed for ${phone}: ${error.message}`,
+          `Attempt ${attempt}/${maxRetries} failed for ${phone}: ${(error as Error).message}`,
         );
         if (attempt === maxRetries) {
-          return { phone, status: 'failed', error: error.message };
+          return { phone, status: 'failed', error: (error as Error).message };
         }
         await this.delay(1000 * attempt);
       }
     }
+
+    // Unreachable but satisfies TypeScript's return-type check
+    return { phone, status: 'failed', error: 'All retries exhausted' };
   }
 
   async sendImageMessage(
@@ -201,16 +203,14 @@ export class WhatsappService implements OnModuleInit, OnModuleDestroy {
     try {
       const content: AnyMessageContent = {
         image: { url: imageUrl },
-        caption,
+        caption: caption ?? undefined,
       };
-      const msg = await this.sock.sendMessage(jid, content);
-      return { phone, status: 'sent', messageId: msg?.key?.id, sentAt: new Date() };
+      const msg = await this.sock!.sendMessage(jid, content);
+      return { phone, status: 'sent', messageId: msg?.key?.id ?? undefined, sentAt: new Date() };
     } catch (error) {
-      return { phone, status: 'failed', error: error.message };
+      return { phone, status: 'failed', error: (error as Error).message };
     }
   }
-
-  // send other message types (audio, video, document) can be implemented similarly
 
   async sendMediaMessage(
     phone: string,
@@ -223,19 +223,24 @@ export class WhatsappService implements OnModuleInit, OnModuleDestroy {
     }
 
     const jid = this.normalizeJid(phone);
-    const content: AnyMessageContent = {
-      ...(mediaType === 'image' && { image: { url: mediaUrl } }),
-      ...(mediaType === 'video' && { video: { url: mediaUrl } }),
-      ...(mediaType === 'audio' && { audio: { url: mediaUrl } }),
-      ...(mediaType === 'document' && { document: { url: mediaUrl } }),
-      caption,
-    };
+
+    // Build content per media type — document requires mimetype
+    let content: AnyMessageContent;
+    if (mediaType === 'image') {
+      content = { image: { url: mediaUrl }, caption: caption ?? undefined };
+    } else if (mediaType === 'video') {
+      content = { video: { url: mediaUrl }, caption: caption ?? undefined };
+    } else if (mediaType === 'audio') {
+      content = { audio: { url: mediaUrl }, mimetype: 'audio/mp4' };
+    } else {
+      content = { document: { url: mediaUrl }, mimetype: 'application/octet-stream', caption: caption ?? undefined };
+    }
 
     try {
-      const msg = await this.sock.sendMessage(jid, content);
-      return { phone, status: 'sent', messageId: msg?.key?.id, sentAt: new Date() };
+      const msg = await this.sock!.sendMessage(jid, content);
+      return { phone, status: 'sent', messageId: msg?.key?.id ?? undefined, sentAt: new Date() };
     } catch (error) {
-      return { phone, status: 'failed', error: error.message };
+      return { phone, status: 'failed', error: (error as Error).message };
     }
   }
 
@@ -269,7 +274,7 @@ export class WhatsappService implements OnModuleInit, OnModuleDestroy {
     onProgress?: (result: MessageResult, index: number, total: number) => void,
   ): Promise<BulkResult> {
     const startTime = Date.now();
-    const delay = this.configService.get<number>('whatsapp.delayBetweenMessages');
+    const delay = this.configService.get<number>('whatsapp.delayBetweenMessages') ?? 1500;
     const results: MessageResult[] = [];
 
     this.logger.log(`📤 Starting bulk send to ${phones.length} numbers`);
@@ -289,9 +294,7 @@ export class WhatsappService implements OnModuleInit, OnModuleDestroy {
         onProgress(result, i + 1, phones.length);
       }
 
-      this.logger.log(
-        `[${i + 1}/${phones.length}] ${phone} → ${result.status}`,
-      );
+      this.logger.log(`[${i + 1}/${phones.length}] ${phone} → ${result.status}`);
 
       // Delay between messages (except last one)
       if (i < phones.length - 1) {
@@ -308,14 +311,7 @@ export class WhatsappService implements OnModuleInit, OnModuleDestroy {
       `✅ Bulk done: ${sent} sent, ${failed} failed, ${skipped} skipped (${duration}ms)`,
     );
 
-    return {
-      total: phones.length,
-      sent,
-      failed,
-      skipped,
-      results,
-      duration,
-    };
+    return { total: phones.length, sent, failed, skipped, results, duration };
   }
 
   // ─── Helpers ──────────────────────────────────────────────────────────────
